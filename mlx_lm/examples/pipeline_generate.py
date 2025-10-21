@@ -32,14 +32,25 @@ from mlx_lm.utils import load_model, load_tokenizer
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
 
+# def download(repo: str, allow_patterns: list[str]) -> Path:
+#     return Path(
+#         snapshot_download(
+#             repo,
+#             allow_patterns=allow_patterns,
+#         )
+#     )
+
 def download(repo: str, allow_patterns: list[str]) -> Path:
+    p = Path(repo)
+    if p.exists():  # 本地模型路径：直接返回
+        return p
+    # 远端 HF 仓库：按需下载指定文件
     return Path(
         snapshot_download(
-            repo,
+            repo_id=repo,
             allow_patterns=allow_patterns,
         )
     )
-
 
 def shard_and_load(repo):
     # Get model path with everything but weight safetensors
@@ -87,7 +98,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM pipelined inference example")
     parser.add_argument(
         "--model",
-        default="mlx-community/DeepSeek-R1-3bit",
+        default="/Volumes/Data/lmstudio/lmstudio-community/Qwen3-4b-Instruct-2507-MLX-8bit",
         help="HF repo or path to local model.",
     )
     parser.add_argument(
