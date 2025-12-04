@@ -25,20 +25,12 @@ import mlx.core as mx
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 
-from mlx_lm import load, stream_generate
+from mlx_lm import stream_generate
 from mlx_lm.utils import load_model, load_tokenizer
 
 # Needed for 8 bit model
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
-
-# def download(repo: str, allow_patterns: list[str]) -> Path:
-#     return Path(
-#         snapshot_download(
-#             repo,
-#             allow_patterns=allow_patterns,
-#         )
-#     )
 
 def download(repo: str, allow_patterns: list[str]) -> Path:
     p = Path(repo)
@@ -55,7 +47,7 @@ def download(repo: str, allow_patterns: list[str]) -> Path:
 def shard_and_load(repo):
     # Get model path with everything but weight safetensors
     model_path = download(
-        args.model,
+        repo,
         allow_patterns=["*.json", "*.py", "tokenizer.model", "*.tiktoken", "*.txt"],
     )
 
@@ -76,7 +68,7 @@ def shard_and_load(repo):
         local_files.add(weight_index[k])
 
     # Download weights for local shard
-    download(args.model, allow_patterns=local_files)
+    download(repo, allow_patterns=local_files)
 
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
@@ -92,7 +84,6 @@ def shard_and_load(repo):
     # model for the first time.
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
     return model, tokenizer
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="LLM pipelined inference example")

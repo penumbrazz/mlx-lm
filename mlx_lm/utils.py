@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import os
+import resource
 import shutil
 from pathlib import Path
 from textwrap import dedent
@@ -14,6 +15,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    List,
     Optional,
     Tuple,
     Type,
@@ -31,13 +33,14 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
 else:
     from huggingface_hub import snapshot_download
 
-from mlx.utils import tree_flatten, tree_map, tree_reduce
-from transformers import PreTrainedTokenizer
+# For large models with lots of files
+resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
+
+from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Local imports
-from .tokenizer_utils import TokenizerWrapper, load_tokenizer
-from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import get_total_parameters, load_adapters
+from .tokenizer_utils import TokenizerWrapper
+from .tokenizer_utils import load as _load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {
@@ -74,6 +77,20 @@ def _get_classes(config: dict):
     return arch.Model, arch.ModelArgs
 
 
+def get_total_parameters(model):
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+
+    def nparams(m):
+        if hasattr(m, "bits"):
+            n = 0 if not hasattr(m, "bias") else m.bias.size
+            return n + m.weight.size * 32 // m.bits
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    return sum(nparams(m) for _, m in leaf_modules)
+
+
 def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
@@ -82,7 +99,11 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
-def _download(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def _download(
+    path_or_hf_repo: str,
+    revision: Optional[str] = None,
+    allow_patterns: List[str] = None,
+) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -97,21 +118,22 @@ def _download(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
+        allow_patterns = allow_patterns or [
+            "*.json",
+            "model*.safetensors",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ]
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
                 revision=revision,
-                allow_patterns=[
-                    "*.json",
-                    "model*.safetensors",
-                    "*.py",
-                    "tokenizer.model",
-                    "*.tiktoken",
-                    "tiktoken.model",
-                    "*.txt",
-                    "*.jsonl",
-                    "*.jinja",
-                ],
+                allow_patterns=allow_patterns,
             )
         )
 
@@ -136,7 +158,7 @@ def load_model(
     model_path: Path,
     lazy: bool = False,
     strict: bool = True,
-    model_config: dict = {},
+    model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -163,7 +185,8 @@ def load_model(
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     config = load_config(model_path)
-    config.update(model_config)
+    if model_config is not None:
+        config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
@@ -215,6 +238,11 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "compressed-tensors":
+            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -225,14 +253,42 @@ def load_model(
     return model, config
 
 
+def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
+    from .tuner.utils import load_adapters as _load_adapters
+
+    return _load_adapters(model, adapter_path)
+
+
+def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
+    """Load a huggingface tokenizer and try to infer the type of streaming
+    detokenizer to use.
+    """
+    model_path = _download(
+        model_path,
+        allow_patterns=[
+            "*.json",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ],
+    )
+    return _load_tokenizer(
+        model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids
+    )
+
+
 def load(
     path_or_hf_repo: str,
-    tokenizer_config={},
-    model_config={},
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[Dict[str, Any]] = None,
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     return_config: bool = False,
-    revision: str = None,
+    revision: Optional[str] = None,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -271,6 +327,62 @@ def load(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )
 
+    if return_config:
+        return model, tokenizer, config
+    else:
+        return model, tokenizer
+
+
+def pipeline_load(repo, return_config=False):
+    # Get model path with everything but weight safetensors
+    model_path = _download(
+        repo,
+        allow_patterns=[
+            "*.json",
+            "*.py",
+            "tokenizer.model",
+            "*.tiktoken",
+            "tiktoken.model",
+            "*.txt",
+            "*.jsonl",
+            "*.jinja",
+        ],
+    )
+
+    # Lazy load and shard model to figure out which weights we need
+    model, config = load_model(model_path, lazy=True, strict=False)
+
+    group = mx.distributed.init()
+    rank = group.rank()
+    model.model.pipeline(group)
+
+    # Figure out which files we need for the local shard
+    with open(model_path / "model.safetensors.index.json", "r") as fid:
+        weight_index = json.load(fid)["weight_map"]
+
+    local_files = set()
+    for k, _ in tree_flatten(model.parameters()):
+        if file_name := weight_index.get(k, None) is None:
+            raise ValueError(
+                "Pipeline loading is only supported for MLX converted models."
+            )
+        local_files.add(weight_index[k])
+
+    # Download weights for local shard
+    _download(repo, allow_patterns=local_files)
+
+    # Load and shard the model, and load the weights
+    tokenizer = load_tokenizer(
+        model_path,
+        {"trust_remote_code": True},
+        eos_token_ids=config.get("eos_token_id", None),
+    )
+    model, _ = load_model(model_path, lazy=True, strict=False)
+    model.model.pipeline(group)
+    mx.eval(model.parameters())
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
     if return_config:
         return model, tokenizer, config
     else:
@@ -518,6 +630,52 @@ def quantize_model(
     print(f"[INFO] Quantized model with {bpw:.3f} bits per weight.")
 
     return model, quantized_config
+
+
+def dequantize_model(model: nn.Module) -> nn.Module:
+    """
+    Dequantize the quantized layers in the model.
+
+    Args:
+        model (nn.Module): The model with quantized layers.
+
+    Returns:
+        nn.Module: The model with dequantized layers.
+    """
+    from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+
+    dequantize_layers = []
+    for name, module in model.named_modules():
+        bias = "bias" in module
+        if isinstance(module, nn.QuantizedLinear):
+            cls = nn.Linear
+            kwargs = {"bias": bias}
+        elif isinstance(module, nn.QuantizedEmbedding):
+            kwargs = {}
+            cls = nn.Embedding
+        elif isinstance(module, QuantizedSwitchLinear):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        else:
+            continue
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            module.group_size,
+            module.bits,
+            module.mode,
+        )
+        args = weight.shape[::-1]
+        m = cls(*args, **kwargs)
+        if bias:
+            m.bias = module.bias
+        m.weight = weight
+        dequantize_layers.append((name, m))
+
+    if len(dequantize_layers) > 0:
+        model.update_modules(tree_unflatten(dequantize_layers))
+    return model
 
 
 def save_config(

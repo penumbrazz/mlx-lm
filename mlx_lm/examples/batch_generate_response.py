@@ -35,4 +35,23 @@ result = batch_generate(model, tokenizer, prompts, verbose=True, max_tokens=4096
 for result_str in result.texts:
     print("===")
     print(result_str)
-#print(result.texts[0])
+
+# Example using prompt caches for faster generation
+prompts2 = [
+    "Could you summarize that?",
+    "And what about the sea?",
+    "Try again?",
+    "And Mt Olympus?",
+]
+prompts2 = [
+    tokenizer.apply_chat_template(
+        [{"role": "user", "content": p}],
+        add_generation_prompt=True,
+    )
+    for p in prompts2
+]
+
+result2 = batch_generate(
+    model, tokenizer, prompts2, verbose=False, prompt_caches=result.caches
+)
+print(result2.texts[-1])
