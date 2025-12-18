@@ -874,7 +874,7 @@ def _make_cache(model, left_padding):
     """
 
     def to_batch_cache(c):
-        if isinstance(c, KVCache):
+        if type(c) is KVCache:
             return BatchKVCache(left_padding)
         elif isinstance(c, ArraysCache):
             c.left_padding = mx.array(left_padding)
@@ -1325,6 +1325,7 @@ def main():
             tokenize=False,
             continue_final_message=has_prefill,
             add_generation_prompt=not has_prefill,
+            return_dict=False,
             **template_kwargs,
         )
 
@@ -1336,6 +1337,7 @@ def main():
                 messages,
                 tokenize=False,
                 continue_final_message=has_prefill,
+                return_dict=False,
                 add_generation_prompt=not has_prefill,
             )
             prompt = prompt[test_prompt.index("<query>") :]
